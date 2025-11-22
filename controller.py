@@ -20,7 +20,7 @@ MAX_SPEED = 100.0
 MIN_SPEED = 5.0
 
 # BRAKING_LOOKAHEAD
-BRAKING_LOOKAHEAD = 200
+BRAKING_LOOKAHEAD = 150
 
 # LATERAL_ACCEL_LIMIT (Safety Margin)
 LATERAL_ACCEL_LIMIT = 9.0
@@ -49,9 +49,16 @@ def lower_controller(
 
 
 def find_target_point(car_position, centerline, lookahead_indices):
+    """
+    Finds the target point on the centerline given the car's position and lookahead distance.
+    Returns the target point as a 2D numpy array.
+    """
+    # Calculate distances from car position to all centerline points
     distances = np.linalg.norm(centerline - car_position, axis=1)
     closest_idx = np.argmin(distances)
     target_idx = (closest_idx + int(lookahead_indices)) % centerline.shape[0]
+
+    # Return the closest point on the centerline as the target point
     return centerline[target_idx]
 
 
@@ -68,7 +75,9 @@ def calculate_curvature_velocity(state, racetrack, parameters):
 
     step = 5
 
+    # for each point in lookahead window, calculate curvature and safe speed
     for i in range(0, BRAKING_LOOKAHEAD, step):
+        # Retrieve three points that are 'step' apart
         idx1 = (current_idx + i) % num_points
         idx2 = (current_idx + i + step) % num_points
         idx3 = (current_idx + i + 2 * step) % num_points
@@ -87,19 +96,25 @@ def calculate_curvature_velocity(state, racetrack, parameters):
         cos_angle = np.clip(cos_angle, -1.0, 1.0)
         angle = np.arccos(cos_angle)
 
+        # if angle is too small, means we are on a straight line
+        # R is radius curvature (small R => sharp turn)
         if angle < 0.035:
+            # Approximate straight line with large radius
             R = 10000.0
         else:
+            # Calculate radius of curvature
             ds = np.linalg.norm(v1)
             R = ds / angle
 
-        # 1. Corner Speed Limit
+        # Corner Speed Limit (max speed at the apex to avoid sliding out)
+        # Is the target speed at the corner itself
         v_corner_limit = np.sqrt(LATERAL_ACCEL_LIMIT * R)
 
         # 2. Braking Distance Logic
         dist_to_corner = np.linalg.norm(p1 - car_position)
         v_allowable = np.sqrt(v_corner_limit**2 + 2 * AVAILABLE_DECEL * dist_to_corner)
 
+        # Update minimum safe velocity across all lookahead points
         if v_allowable < min_safe_velocity:
             min_safe_velocity = v_allowable
 
