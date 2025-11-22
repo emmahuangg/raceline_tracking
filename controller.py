@@ -13,7 +13,6 @@ LOOKAHEAD_MAX_IDX = 20
 
 # --- 3. LATERAL CONTROL ---
 STEERING_LOOKAHEAD_TIME = 0.4
-PHYSICAL_STEERING_LIMIT = 0.9
 
 # --- 4. PREDICTIVE SPEED CONTROL ---
 MAX_SPEED = 100.0
@@ -130,6 +129,7 @@ def controller(
     current_heading = state[4]
     current_velocity = max(state[3], 1.0)
     wheelbase = parameters[0] 
+    max_steering_angle = parameters[4]
 
     # Lookahead Logic
     lookahead_idx = LOOKAHEAD_GAIN * current_velocity
@@ -148,7 +148,7 @@ def controller(
     dot_phi_desired = delta_phi / STEERING_LOOKAHEAD_TIME
     desired_steering_angle = np.arctan((wheelbase * dot_phi_desired) / current_velocity)
     desired_steering_angle = np.clip(
-        desired_steering_angle, -PHYSICAL_STEERING_LIMIT, PHYSICAL_STEERING_LIMIT
+        desired_steering_angle, -max_steering_angle, max_steering_angle
     )
 
     # Speed Control
