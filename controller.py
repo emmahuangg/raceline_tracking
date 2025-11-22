@@ -2,115 +2,141 @@ import numpy as np
 from numpy.typing import ArrayLike
 from simulator import RaceTrack
 
+# --- 1. LOWER CONTROLLER GAINS ---
+K_P_STEER = 4.0
+K_P_ACCEL = 5.0
+
+# --- 2. LOOKAHEAD LOGIC (Steering) ---
+LOOKAHEAD_GAIN = 0.25
+LOOKAHEAD_MIN_IDX = 3
+LOOKAHEAD_MAX_IDX = 20
+
+# --- 3. LATERAL CONTROL ---
+STEERING_LOOKAHEAD_TIME = 0.4
+PHYSICAL_STEERING_LIMIT = 0.9
+
+# --- 4. PREDICTIVE SPEED CONTROL ---
+MAX_SPEED = 100.0
+MIN_SPEED = 5.0
+
+# BRAKING_LOOKAHEAD
+BRAKING_LOOKAHEAD = 200
+
+# LATERAL_ACCEL_LIMIT (Safety Margin)
+LATERAL_ACCEL_LIMIT = 9.0
+
+# AVAILABLE_DECEL (Braking Confidence)
+AVAILABLE_DECEL = 7.0
+
+
 def lower_controller(
     state: ArrayLike, desired: ArrayLike, parameters: ArrayLike
 ) -> ArrayLike:
-    """
-    Computes low-level inputs (steering rate and acceleration).
-    """
-    # Extract state: [x, y, delta, v, phi]
+    """Computes low-level inputs (steering rate and acceleration)."""
     current_steering_angle = state[2]
     current_velocity = state[3]
 
     desired_steering_angle = desired[0]
     desired_velocity = desired[1]
 
-    # --- Lateral Control (Steering) ---
-    # High gain to ensure the wheels snap to the desired angle quickly.
-    # If this is too low, the car lags behind the command and runs wide.
-    K_P_steer = 4.0  
     steering_error = desired_steering_angle - current_steering_angle
-    steering_rate = K_P_steer * steering_error
+    steering_rate = K_P_STEER * steering_error
 
-    # --- Longitudinal Control (Acceleration) ---
-    # We want crisp acceleration and braking.
-    K_P_accel = 2.0 
     velocity_error = desired_velocity - current_velocity
-    acceleration = K_P_accel * velocity_error
+    acceleration = K_P_ACCEL * velocity_error
 
     return np.array([steering_rate, acceleration])
 
 
 def find_target_point(car_position, centerline, lookahead_indices):
-    """
-    Finds the point on the track to aim for.
-    """
     distances = np.linalg.norm(centerline - car_position, axis=1)
     closest_idx = np.argmin(distances)
-
-    # Wrap around the track indices
     target_idx = (closest_idx + int(lookahead_indices)) % centerline.shape[0]
     return centerline[target_idx]
+
+
+def calculate_curvature_velocity(state, racetrack, parameters):
+    """
+    Calculates target velocity using distance-based braking logic.
+    """
+    car_position = state[0:2]
+    distances = np.linalg.norm(racetrack.centerline - car_position, axis=1)
+    current_idx = np.argmin(distances)
+    num_points = racetrack.centerline.shape[0]
+
+    min_safe_velocity = MAX_SPEED
+
+    step = 5
+
+    for i in range(0, BRAKING_LOOKAHEAD, step):
+        idx1 = (current_idx + i) % num_points
+        idx2 = (current_idx + i + step) % num_points
+        idx3 = (current_idx + i + 2 * step) % num_points
+
+        p1 = racetrack.centerline[idx1]
+        p2 = racetrack.centerline[idx2]
+        p3 = racetrack.centerline[idx3]
+
+        v1 = p2 - p1
+        v2 = p3 - p2
+
+        if np.linalg.norm(v1) < 0.1 or np.linalg.norm(v2) < 0.1:
+            continue
+
+        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)
+        angle = np.arccos(cos_angle)
+
+        if angle < 0.035:
+            R = 10000.0
+        else:
+            ds = np.linalg.norm(v1)
+            R = ds / angle
+
+        # 1. Corner Speed Limit
+        v_corner_limit = np.sqrt(LATERAL_ACCEL_LIMIT * R)
+
+        # 2. Braking Distance Logic
+        dist_to_corner = np.linalg.norm(p1 - car_position)
+        v_allowable = np.sqrt(v_corner_limit**2 + 2 * AVAILABLE_DECEL * dist_to_corner)
+
+        if v_allowable < min_safe_velocity:
+            min_safe_velocity = v_allowable
+
+    return np.clip(min_safe_velocity, MIN_SPEED, MAX_SPEED)
 
 
 def controller(
     state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack
 ) -> ArrayLike:
-    """
-    Controller tracking the centerline tightly using Velocity-Based Lookahead.
-    """
-    
-    # 1. Extract Car State
+    """Controller tracking the centerline tightly using Velocity-Based Lookahead."""
+
     car_position = state[0:2]
     current_heading = state[4]
-    current_velocity = max(state[3], 1.0) # Avoid division by zero
+    current_velocity = max(state[3], 1.0)
     wheelbase = parameters[0] 
 
-    # --- 1. VELOCITY-BASED LOOKAHEAD ---
-    # This is the key to tight tracking.
-    # Rule: Lookahead Index = Gain * Velocity
-    # At 20 m/s -> Look ~12 points ahead (Stable)
-    # At 8 m/s  -> Look ~5 points ahead (Tight cornering)
-    LOOKAHEAD_GAIN = 0.3
-    
+    # Lookahead Logic
     lookahead_idx = LOOKAHEAD_GAIN * current_velocity
-    
-    # Clamp the lookahead to sane values
-    # Minimum 4 prevents aiming at the car's own bumper (instability)
-    # Maximum 20 prevents cutting straight across massive curves
-    lookahead_idx = np.clip(lookahead_idx, 4, 20)
+    lookahead_idx = np.clip(lookahead_idx, LOOKAHEAD_MIN_IDX, LOOKAHEAD_MAX_IDX)
 
-    # --- 2. COMPUTE HEADING ERROR ---
     target_point = find_target_point(car_position, racetrack.centerline, lookahead_idx)
 
     delta_x = target_point[0] - car_position[0]
     delta_y = target_point[1] - car_position[1]
-    
-    # The angle we WANT to be facing
-    desired_heading = np.arctan2(delta_y, delta_x)
-    
-    # The error between current heading and desired heading
-    delta_phi = desired_heading - current_heading
 
-    # Wrap error to [-pi, pi] to handle the 360-0 degree crossover
+    desired_heading = np.arctan2(delta_y, delta_x)
+    delta_phi = desired_heading - current_heading
     delta_phi = np.arctan2(np.sin(delta_phi), np.cos(delta_phi))
 
-    # --- 3. LATERAL CONTROL LAW ---
-    # We use a "Time Constant" approach. 
-    # We want to correct the error delta_phi in LOOKAHEAD_TIME seconds.
-    # Smaller time = Tighter tracking (more aggressive)
-    # Larger time = Smoother tracking (less oscillation)
-    LOOKAHEAD_TIME = 0.4 
-    
-    dot_phi_desired = delta_phi / LOOKAHEAD_TIME
-
-    # Kinematic Bicycle Model: delta = arctan( L * phi_dot / v )
+    # Lateral Control
+    dot_phi_desired = delta_phi / STEERING_LOOKAHEAD_TIME
     desired_steering_angle = np.arctan((wheelbase * dot_phi_desired) / current_velocity)
+    desired_steering_angle = np.clip(
+        desired_steering_angle, -PHYSICAL_STEERING_LIMIT, PHYSICAL_STEERING_LIMIT
+    )
 
-    # Clip to physical limits
-    desired_steering_angle = np.clip(desired_steering_angle, -0.9, 0.9)
-
-    # --- 4. PREDICTIVE SPEED CONTROL ---
-    # Slow down based on the SHARPNESS of the turn we are approaching.
-    # We use 'delta_phi' (heading error) to decide. 
-    # Large heading error = Sharp turn incoming = BRAKE.
-    
-    MAX_SPEED = 22.0
-    MIN_SPEED = 8.0
-    
-    # If heading error is > 0.3 rad (~17 degrees), we start braking hard.
-    error_scaling = np.clip(np.abs(delta_phi) / 0.5, 0.0, 1.0)
-    
-    desired_velocity = MAX_SPEED - (error_scaling * (MAX_SPEED - MIN_SPEED))
+    # Speed Control
+    desired_velocity = calculate_curvature_velocity(state, racetrack, parameters)
 
     return np.array([desired_steering_angle, desired_velocity])
